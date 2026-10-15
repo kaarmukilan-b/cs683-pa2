@@ -1,4 +1,8 @@
-# ChampSim
+# Our submission 
+
+the terminal logs are present task-wise in terminal_outputs/
+
+## ChampSim
 
 ChampSim is a trace-based simulator for microarchitecture research.
 
