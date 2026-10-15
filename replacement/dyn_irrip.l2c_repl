@@ -1,0 +1,179 @@
+#include "cache.h"
+
+
+#define maxRRPV 3
+
+// ---------------- tunables (all overridable with -D) ----------------
+#ifndef THRESHOLD_PCT
+#define THRESHOLD_PCT        25   
+#endif
+#ifndef LEADER_STRIDE
+#define LEADER_STRIDE        32   // set % LEADER_STRIDE == 0 -> SRRIP leader (1024/32 = 32 leaders)
+#endif
+#ifndef EPOCH
+#define EPOCH                4096 // leader events per decision
+#endif
+#ifndef INIT_IRRIP_MODE
+#define INIT_IRRIP_MODE      1    // mode used before the first decision
+#endif
+
+// I-RRIP parameters (same as Task 2A)
+#define INSTR_INSERT_RRPV     1   // demand instruction fill
+#define INSTR_PF_INSERT_RRPV  2   // prefetched instruction fill
+#define DATA_INSERT_RRPV      2   // demand data fill
+#define DATA_PF_INSERT_RRPV   3   // prefetched data / writeback fill
+#define INSTR_EVICT_PERIOD    4   // in a tie, evict the instruction line 1 time in N
+#define PROMOTE_ON_PF_WB_HIT  1   // 0: prefetch/writeback hits do not promote
+// --------------------------------------------------------------------
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];
+
+// leader-set statistics (updated only by leader sets)
+static uint64_t i_acc = 0, i_miss = 0, t_acc = 0, t_miss = 0;
+static uint64_t epoch_cnt = 0;
+static uint8_t  irrip_mode = INIT_IRRIP_MODE;
+static uint32_t tie_ctr = 0;                 // deterministic tie-break (no rand())
+
+// bookkeeping for the final report
+static uint64_t n_epochs = 0, n_epochs_irrip = 0, n_switches = 0;
+
+static inline bool is_leader(uint32_t set)  { return (set % LEADER_STRIDE) == 0; }
+// leaders ALWAYS use SRRIP; followers follow the current mode
+static inline bool use_irrip(uint32_t set)  { return !is_leader(set) && irrip_mode; }
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C (threshold=" << THRESHOLD_PCT
+         << "%, leader stride=" << LEADER_STRIDE << ", epoch=" << EPOCH << ")" << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+        }
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                const BLOCK *current_set, uint64_t ip,
+                                uint64_t full_addr, uint32_t type)
+{
+    // an empty way is always the best victim (both modes)
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    if (!use_irrip(set))
+    {
+        // ---------- plain SRRIP (same as rrip.l2c_repl) ----------
+        while (1)
+        {
+            for (int i = 0; i < L2C_WAY; i++)
+                if (l2_rrpv[set][i] == maxRRPV)
+                    return i;
+            for (int i = 0; i < L2C_WAY; i++)
+                l2_rrpv[set][i]++;
+        }
+    }
+
+    // ---------- I-RRIP: RRPV decides, instruction bias only breaks ties ----------
+    while (1)
+    {
+        int data_v = -1, instr_v = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] != maxRRPV) continue;
+            if (l2_is_instr[set][i]) { if (instr_v < 0) instr_v = i; }
+            else                     { if (data_v  < 0) data_v  = i; }
+        }
+
+        if (data_v >= 0 && instr_v >= 0) {   // tie: favour evicting data, 1-in-N evict code
+            bool pick_instr = (tie_ctr++ % INSTR_EVICT_PERIOD) == 0;
+            return pick_instr ? instr_v : data_v;
+        }
+        if (data_v  >= 0) return data_v;
+        if (instr_v >= 0) return instr_v;
+
+        for (int i = 0; i < L2C_WAY; i++)    // nothing at max: age everyone
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+        uint64_t full_addr, uint64_t ip, uint64_t victim_addr,
+        uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // ---------- 1) leader sets: gather workload statistics ----------
+    // A hit is an access; a fill is an access that missed. Writebacks are not
+    // demand traffic, so they are ignored.
+    if (is_leader(set) && type != WRITEBACK)
+    {
+        t_acc++;
+        if (isInstruction) i_acc++;
+        if (!hit) {
+            t_miss++;
+            if (isInstruction) i_miss++;
+        }
+
+        if (++epoch_cnt == EPOCH)
+        {
+            // integer compare: (i_acc+i_miss)*100 > THRESHOLD_PCT*(t_acc+t_miss)
+            uint8_t new_mode = ((i_acc + i_miss) * 100 > (uint64_t)THRESHOLD_PCT * (t_acc + t_miss)) ? 1 : 0;
+
+            n_epochs++;
+            if (new_mode) n_epochs_irrip++;
+            if (new_mode != irrip_mode) n_switches++;
+            irrip_mode = new_mode;
+
+            // halve so old phases fade out
+            i_acc >>= 1; i_miss >>= 1; t_acc >>= 1; t_miss >>= 1;
+            epoch_cnt = 0;
+        }
+    }
+
+    // ---------- 2) update replacement state ----------
+    if (hit)
+    {
+        if (!use_irrip(set)) {
+            l2_rrpv[set][way] = 0;                 // SRRIP promotion
+        } else {
+#if !PROMOTE_ON_PF_WB_HIT
+            if (type == PREFETCH || type == WRITEBACK)
+                return;
+#endif
+            if (l2_rrpv[set][way] > 0)             // I-RRIP promotion: one step
+                l2_rrpv[set][way]--;
+        }
+    }
+    else
+    {
+        // keep the instruction bit valid in both modes
+        l2_is_instr[set][way] = isInstruction ? 1 : 0;
+
+        if (!use_irrip(set)) {
+            l2_rrpv[set][way] = maxRRPV - 1;       // SRRIP insertion (RRPV 2)
+        } else if (isInstruction) {
+            l2_rrpv[set][way] = (type == PREFETCH) ? INSTR_PF_INSERT_RRPV : INSTR_INSERT_RRPV;
+        } else {
+            l2_rrpv[set][way] = (type == PREFETCH || type == WRITEBACK) ? DATA_PF_INSERT_RRPV
+                                                                        : DATA_INSERT_RRPV;
+        }
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "[Dyn I-RRIP] epochs: " << n_epochs
+         << " | epochs in I-RRIP mode: " << n_epochs_irrip
+         << " | mode switches: " << n_switches
+         << " | final mode: " << (irrip_mode ? "I-RRIP" : "SRRIP") << endl;
+}

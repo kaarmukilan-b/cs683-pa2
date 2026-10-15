@@ -1,0 +1,122 @@
+#include "cache.h"
+
+/*
+ * I-RRIP: Instruction-conscious RRIP for the (unified) L2 cache.
+ *
+ * Per-line state : 2-bit RRPV + 1-bit "is instruction line".
+ * Global state   : one 3-bit tie-break counter.
+ *
+ * INSERTION : instruction lines enter closer to reuse than data lines
+ *             (a missed instruction stalls the frontend; a data miss can
+ *             partly overlap). Prefetched lines are unproven, so they enter
+ *             one step worse than the demand line of the same kind.
+ * PROMOTION : every hit moves the line one step closer (RRPV-1). A line that
+ *             has been hit therefore ranks above one that was only inserted.
+ * EVICTION  : RRPV decides first (predicted reuse distance). Instruction
+ *             status only breaks ties among lines at max RRPV, and even then
+ *             only probabilistically, so stale code cannot hold a way forever.
+ */
+
+#define maxRRPV 3
+
+// ---------------- tunables ----------------
+#define INSTR_INSERT_RRPV     1  // demand instruction fill (try 0 as an experiment)
+#define INSTR_PF_INSERT_RRPV  2  // prefetched instruction fill
+#define DATA_INSERT_RRPV      2  // demand data fill (same as SRRIP)
+#define DATA_PF_INSERT_RRPV   3  // prefetched data / writeback fill
+#define INSTR_EVICT_PERIOD    4  // in a tie, evict the instruction line 1 time in N (sweep 4/8/16)
+#define PROMOTE_ON_PF_WB_HIT  1  // 0: prefetch/writeback hits do not promote
+// ------------------------------------------
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];   // 1 if the resident line is an instruction line
+static uint32_t tie_ctr = 0;              // global, deterministic (no rand(): reproducible results)
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+        }
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                const BLOCK *current_set, uint64_t ip,
+                                uint64_t full_addr, uint32_t type)
+{
+    // 1) an empty way is always the best victim
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    while (1)
+    {
+        // 2) first data line and first instruction line sitting at max RRPV
+        int data_v = -1, instr_v = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] != maxRRPV) continue;
+            if (l2_is_instr[set][i]) { if (instr_v < 0) instr_v = i; }
+            else                     { if (data_v  < 0) data_v  = i; }
+        }
+
+        // 3) both kinds are predicted dead: tie. Bias toward evicting data,
+        //    but evict the instruction line 1 time in INSTR_EVICT_PERIOD so
+        //    dead code is eventually cleared.
+        if (data_v >= 0 && instr_v >= 0) {
+            bool pick_instr = (tie_ctr++ % INSTR_EVICT_PERIOD) == 0;
+            return pick_instr ? instr_v : data_v;
+        }
+
+        // 4) only one kind at max RRPV: RRPV decides, no bias
+        if (data_v  >= 0) return data_v;
+        if (instr_v >= 0) return instr_v;
+
+        // 5) nothing at max RRPV: age every line (all are < maxRRPV here)
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+        uint64_t full_addr, uint64_t ip, uint64_t victim_addr,
+        uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit)
+    {
+        // PROMOTION: one step closer to reuse for every kind of line
+#if !PROMOTE_ON_PF_WB_HIT
+        if (type == PREFETCH || type == WRITEBACK)
+            return;
+#endif
+        if (l2_rrpv[set][way] > 0)
+            l2_rrpv[set][way]--;
+    }
+    else
+    {
+        // INSERTION (fill): record the line kind, then pick the starting RRPV
+        l2_is_instr[set][way] = isInstruction ? 1 : 0;
+
+        if (isInstruction)
+            l2_rrpv[set][way] = (type == PREFETCH) ? INSTR_PF_INSERT_RRPV
+                                                   : INSTR_INSERT_RRPV;
+        else
+            l2_rrpv[set][way] = (type == PREFETCH || type == WRITEBACK) ? DATA_PF_INSERT_RRPV
+                                                                        : DATA_INSERT_RRPV;
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+}

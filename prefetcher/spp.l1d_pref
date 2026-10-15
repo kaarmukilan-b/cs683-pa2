@@ -1,24 +1,257 @@
 #include "cache.h"
 
+/*
+ * Stride Pattern Prefetcher (SPP) - L1D, per-IP, within-page only.
+ *
+ * Structures (all sizes are tuned for low storage, see STORAGE section):
+ *  1) IP table  (direct-mapped, 64 entries): per-IP tag, last line addr (12b),
+ *     last stride, uniform-confidence counter, stride-history signature.
+ *  2) Pattern table (256 entries, indexed by signature): predicted next
+ *     stride + 2-bit confidence. Learns non-uniform repeating stride sequences.
+ *  3) Accuracy checker: window counters -> dynamic degree.
+ *
+ * Prediction priority:
+ *   a) If IP's uniform confidence is saturated (==3): prefetch addr + k*stride.
+ *   b) Otherwise (uniform broke / never formed): walk the pattern table
+ *      using the signature, chaining predicted strides (speculative signature).
+ *
+ * Accuracy checker (FIXED):
+ *   accuracy = useful prefetches / prefetches that actually left L1D (missed L1D
+ *   and were sent to the lower level). Prefetch requests that hit in L1D or are
+ *   merged in the PQ/MSHR never become useful, so counting them in the
+ *   denominator (as the earlier version did) made accuracy look tiny and pinned
+ *   the degree at 1. The simulator's own counters (pf_lower_level, pf_useful)
+ *   are the hardware equivalent of two small event counters:
+ *       issued counter  : +1 whenever a prefetch is sent to the lower level
+ *       useful counter  : +1 whenever a demand hits a prefetched L1D line
+ *   Both are cleared at the end of every window of SPP_WINDOW issued prefetches.
+ *
+ * Storage (bits):
+ *  IP entry : valid 1 + tag 8 + last_cl 12 + stride 7 + ucnf 2 + sig 8 = 38 b
+ *             x 64 = 2432 b
+ *  PT entry : stride 7 + conf 2 = 9 b  x 256 = 2304 b
+ *  Accuracy : issued 8 + useful 8 + degree 3 = 19 b   (window = 128 fits in 8 bits)
+ *  TOTAL    : 4755 bits (~594 bytes)
+ */
 
-void CACHE::l1d_prefetcher_initialize() 
+// ---- table geometry ----
+#define SPP_IP_ENTRIES   64
+#define SPP_IP_IDX_MASK  (SPP_IP_ENTRIES - 1)
+#define SPP_TAG_MASK     0xFF
+#define SPP_CL_MASK      0xFFF      // 12-bit line address (4 consecutive pages)
+#define SPP_MAX_STRIDE   63         // |stride| in cache lines, fits 7 bits signed
+#define SPP_SIG_BITS     8
+#define SPP_SIG_MASK     ((1 << SPP_SIG_BITS) - 1)
+#define SPP_PT_ENTRIES   (1 << SPP_SIG_BITS)
+#define SPP_SIG_SHIFT    3
+
+// ---- confidence ----
+#define SPP_UNI_CONF_MAX 3          // uniform used only when counter saturated
+#define SPP_PT_CONF_MAX  3
+#define SPP_PT_CONF_MIN_TO_PREFETCH 2
+
+// ---- accuracy throttling ----
+#define SPP_WINDOW       128        // evaluate accuracy every 128 prefetches sent to lower level
+#define SPP_INIT_DEGREE  4
+// accuracy ranges (useful/issued):  >=75% -> 6 ; >=50% -> 4 ; >=25% -> 2 ; else 1
+#define SPP_DEG_HIGH     6
+#define SPP_DEG_MID      4
+#define SPP_DEG_LOW      2
+#define SPP_DEG_MIN      1
+
+// When the L1D MSHR is busy, 1 = push the prefetch to L2 (original behaviour),
+// 0 = drop it. L2-pushed prefetches had ~9% accuracy on Trace1, so try 0 as well.
+#ifndef SPP_PUSH_TO_L2
+#define SPP_PUSH_TO_L2   0
+#endif
+
+struct SPP_IP_ENTRY {
+    bool     valid;
+    uint8_t  tag;
+    uint16_t last_cl;       // 12 bits used
+    int8_t   last_stride;   // 7 bits used
+    uint8_t  ucnf;          // 2 bits used
+    uint8_t  sig;           // 8 bits used
+    SPP_IP_ENTRY() : valid(false), tag(0), last_cl(0), last_stride(0), ucnf(0), sig(0) {}
+};
+
+struct SPP_PT_ENTRY {
+    int8_t  stride;         // 7 bits used
+    uint8_t conf;           // 2 bits used
+    SPP_PT_ENTRY() : stride(0), conf(0) {}
+};
+
+static SPP_IP_ENTRY spp_ip[SPP_IP_ENTRIES];
+static SPP_PT_ENTRY spp_pt[SPP_PT_ENTRIES];
+
+// accuracy checker state: snapshots of the simulator counters at window start
+// (the simulator keeps running totals; snapshots turn them into per-window counts,
+//  which in hardware are simply the two 8-bit counters cleared every window)
+static uint64_t spp_issued_snap;    // snapshot of pf_lower_level
+static uint64_t spp_useful_snap;    // snapshot of pf_useful
+static uint32_t spp_degree;
+
+// extra bookkeeping for the final stats printout only (not part of the hardware cost)
+static uint64_t spp_total_issued, spp_uniform_trig, spp_pattern_trig, spp_windows;
+static uint64_t spp_deg_hist[SPP_DEG_HIGH + 1];
+static double   spp_last_acc;
+
+static inline uint8_t spp_next_sig(uint8_t sig, int stride)
+{
+    return (uint8_t)(((sig << SPP_SIG_SHIFT) ^ (stride & 0x7F)) & SPP_SIG_MASK);
+}
+
+void CACHE::l1d_prefetcher_initialize()
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+    spp_issued_snap = 0;
+    spp_useful_snap = 0;
+    spp_degree = SPP_INIT_DEGREE;
+    spp_total_issued = spp_uniform_trig = spp_pattern_trig = spp_windows = 0;
+    spp_last_acc = 0.0;
+    for (int i = 0; i <= SPP_DEG_HIGH; i++) spp_deg_hist[i] = 0;
+}
+
+// Issue one prefetch (same-page already checked by caller). Returns true if accepted.
+static inline bool spp_issue(CACHE *c, uint64_t ip, uint64_t addr, uint64_t pf_cl)
+{
+    uint64_t pf_address = pf_cl << LOG2_BLOCK_SIZE;
+    if (c->MSHR.occupancy < (c->MSHR.SIZE >> 1)) {
+        int ret = c->prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+        if (ret) spp_total_issued++;     // stats only; throttling uses pf_lower_level
+        return ret != 0;
+    }
+#if SPP_PUSH_TO_L2
+    // L1 MSHR is busy: push to L2
+    return c->prefetch_line(ip, addr, pf_address, FILL_L2, 0) != 0;
+#else
+    return false;
+#endif
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    // train only on demand accesses
+    if (type == PREFETCH || type == WRITEBACK)
+        return;
+
+    // ---- accuracy checker: re-evaluate degree once SPP_WINDOW prefetches have gone to the lower level ----
+    // (done first so it runs on every demand access, independent of training outcome)
+    if (pf_lower_level < spp_issued_snap || pf_useful < spp_useful_snap) {
+        // simulator counters were reset at the end of warmup: resync
+        spp_issued_snap = pf_lower_level;
+        spp_useful_snap = pf_useful;
+    }
+    uint64_t win_issued = pf_lower_level - spp_issued_snap;
+    if (win_issued >= SPP_WINDOW) {
+        uint64_t win_useful = pf_useful - spp_useful_snap;
+        if (win_useful * 4 >= win_issued * 3)       spp_degree = SPP_DEG_HIGH;  // >=75%
+        else if (win_useful * 2 >= win_issued*1)      spp_degree = SPP_DEG_MID;   // >=50%
+        else if (win_useful * 4 >= win_issued*1)      spp_degree = SPP_DEG_LOW;   // >=25%
+        else                                        spp_degree = SPP_DEG_MIN;
+        spp_last_acc = (double)win_useful / (double)win_issued;
+        spp_windows++;
+        spp_issued_snap = pf_lower_level;
+        spp_useful_snap = pf_useful;
+    }
+
+    uint64_t cl   = addr >> LOG2_BLOCK_SIZE;
+    uint32_t cl12 = (uint32_t)(cl & SPP_CL_MASK);
+    uint32_t idx  = (uint32_t)((ip ^ (ip >> 6)) & SPP_IP_IDX_MASK);
+    uint8_t  tag  = (uint8_t)((ip >> 6) & SPP_TAG_MASK);
+    SPP_IP_ENTRY &e = spp_ip[idx];
+
+    // ---- new IP (or tag conflict): allocate and wait for next access ----
+    if (!e.valid || e.tag != tag) {
+        e.valid = true; e.tag = tag; e.last_cl = cl12;
+        e.last_stride = 0; e.ucnf = 0; e.sig = 0;
+        return;
+    }
+
+    // ---- signed stride in cache lines (12-bit modular difference) ----
+    int diff = (int)((cl12 - e.last_cl) & SPP_CL_MASK);
+    if (diff >= 2048) diff -= 4096;
+    if (diff == 0) return;                       // same line again
+    if (diff > SPP_MAX_STRIDE || diff < -SPP_MAX_STRIDE) {   // jump too large: resync only
+        e.last_cl = cl12;
+        e.ucnf = 0;
+        return;
+    }
+    int stride = diff;
+
+    // ---- train pattern table: sig(before this stride) -> stride ----
+    SPP_PT_ENTRY &p = spp_pt[e.sig];
+    if (p.stride == stride) {
+        if (p.conf < SPP_PT_CONF_MAX) p.conf++;
+    } else if (p.conf > 0) {
+        p.conf--;
+    } else {
+        p.stride = (int8_t)stride;               // replace when confidence exhausted
+        p.conf = 1;
+    }
+
+    // ---- train uniform detector ----
+    if (stride == e.last_stride) {
+        if (e.ucnf < SPP_UNI_CONF_MAX) e.ucnf++;
+    } else {
+        e.ucnf >>= 1;                            // fast but not instantaneous fall-back
+    }
+
+    // ---- update entry history ----
+    e.sig = spp_next_sig(e.sig, stride);
+    e.last_stride = (int8_t)stride;
+    e.last_cl = cl12;
+
+    spp_deg_hist[spp_degree]++;
+
+    // ---- generate prefetches ----
+    uint64_t page = cl >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE);   // page id of demand access
+
+    if (e.ucnf == SPP_UNI_CONF_MAX) {
+        // (a) uniform stride has priority
+        spp_uniform_trig++;
+        int64_t cur = (int64_t)cl;
+        for (uint32_t k = 0; k < spp_degree; k++) {
+            cur += stride;
+            if ((uint64_t)cur >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE) != page) break;  // stay in page
+            spp_issue(this, ip, addr, (uint64_t)cur);
+        }
+    } else {
+        // (b) non-uniform: chain predictions through the pattern table
+        uint8_t sig = e.sig;
+        int64_t cur = (int64_t)cl;
+        bool any = false;
+        for (uint32_t k = 0; k < spp_degree; k++) {
+            SPP_PT_ENTRY &q = spp_pt[sig];
+            if (q.conf < SPP_PT_CONF_MIN_TO_PREFETCH || q.stride == 0) break;
+            cur += q.stride;
+            if ((uint64_t)cur >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE) != page) break;
+            spp_issue(this, ip, addr, (uint64_t)cur);
+            sig = spp_next_sig(sig, q.stride);   // speculative signature for next step
+            any = true;
+        }
+        if (any) spp_pattern_trig++;
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+    return; //metadata_in;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    std::cout << "CPU " << cpu << " L1D SPP final stats" << std::endl;
+    std::cout << "SPP issued(L1 fill, incl. L1 hits): " << spp_total_issued
+              << " uniform-triggers: " << spp_uniform_trig
+              << " pattern-triggers: " << spp_pattern_trig
+              << " windows: " << spp_windows
+              << " last window acc: " << spp_last_acc
+              << " final degree: " << spp_degree << std::endl;
+    std::cout << "SPP degree histogram (per trained access):";
+    for (int d = SPP_DEG_MIN; d <= SPP_DEG_HIGH; d++)
+        std::cout << " d" << d << "=" << spp_deg_hist[d];
+    std::cout << std::endl;
 }
