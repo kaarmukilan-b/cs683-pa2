@@ -1,30 +1,13 @@
 #include "cache.h"
 
-/*
- * I-RRIP: Instruction-conscious RRIP for the (unified) L2 cache.
- *
- * Per-line state : 2-bit RRPV + 1-bit "is instruction line".
- * Global state   : one 3-bit tie-break counter.
- *
- * INSERTION : instruction lines enter closer to reuse than data lines
- *             (a missed instruction stalls the frontend; a data miss can
- *             partly overlap). Prefetched lines are unproven, so they enter
- *             one step worse than the demand line of the same kind.
- * PROMOTION : every hit moves the line one step closer (RRPV-1). A line that
- *             has been hit therefore ranks above one that was only inserted.
- * EVICTION  : RRPV decides first (predicted reuse distance). Instruction
- *             status only breaks ties among lines at max RRPV, and even then
- *             only probabilistically, so stale code cannot hold a way forever.
- */
-
 #define maxRRPV 3
 
 // ---------------- tunables ----------------
-#define INSTR_INSERT_RRPV     1  // demand instruction fill (try 0 as an experiment)
+#define INSTR_INSERT_RRPV     1  // demand instruction fill 
 #define INSTR_PF_INSERT_RRPV  2  // prefetched instruction fill
 #define DATA_INSERT_RRPV      2  // demand data fill (same as SRRIP)
 #define DATA_PF_INSERT_RRPV   3  // prefetched data / writeback fill
-#define INSTR_EVICT_PERIOD    4  // in a tie, evict the instruction line 1 time in N (sweep 4/8/16)
+#define INSTR_EVICT_PERIOD    4  // in a tie, evict the instruction line 1 time in N
 #define PROMOTE_ON_PF_WB_HIT  1  // 0: prefetch/writeback hits do not promote
 // ------------------------------------------
 
